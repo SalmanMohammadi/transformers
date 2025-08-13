@@ -780,6 +780,8 @@ def _load_state_dict_into_meta_model(
     if is_meta_state_dict:
         file_pointer = safe_open(shard_file, framework="pt", device=tensor_device)
 
+    rank = torch.distributed.get_rank()
+    print(f"Rank {rank} parameters device type before sd", set([p.device.type for p in model.parameters()]))
     for param_name, empty_param in state_dict.items():
         if param_name not in expected_keys:  # when loading from ckpt, we skip param if doesnt exist in modeling
             continue
@@ -905,6 +907,7 @@ def _load_state_dict_into_meta_model(
                     value = type(value)(value.data.to(param_to), **val_kwargs, **value.__dict__)
                     setattr(module, param_type, value)
 
+    print(f"Rank {rank} parameters device type after sd", set([p.device.type for p in model.parameters()]))
     if file_pointer is not None:
         file_pointer.__exit__(None, None, None)
 
@@ -4696,9 +4699,10 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if tp_plan is not None and tp_plan != "auto":
             # TODO: we can relax this check when we support taking tp_plan from a json file, for example.
             raise ValueError(f"tp_plan supports 'auto' only for now but got {tp_plan}.")
-        if tp_plan is not None and device_map is not None:
+        if tp_plan is not None and device_map is not None and device_map != "meta" and device_mesh is None:
             raise ValueError(
-                "`tp_plan` and `device_map` are mutually exclusive. Choose either one for parallelization."
+                "`tp_plan` and `device_map` are mutually exclusive. "
+                "Choose either one for parallelization or include a `device_mesh`."
             )
 
         if device_map == "auto" and int(os.environ.get("WORLD_SIZE", "0")):
@@ -4722,7 +4726,8 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                         )
                     device_mesh = device_mesh["tp"]
                 tp_size = device_mesh.size()
-                device_map = torch.device(f"{device_mesh.device_type}:{int(os.environ['LOCAL_RANK'])}")
+                if device_map is None:
+                    device_map = torch.device(f"{device_mesh.device_type}:{int(os.environ['LOCAL_RANK'])}")
 
             if tp_size is None:
                 tp_size = torch.distributed.get_world_size()
@@ -5002,7 +5007,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 )
 
         from_pt = not (from_tf | from_flax)
-
         if from_pt:
             if gguf_file:
                 from .modeling_gguf_pytorch_utils import load_gguf_checkpoint
@@ -5083,6 +5087,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if device_map is not None:
             device_map = _get_device_map(model, device_map, max_memory, hf_quantizer, torch_dtype, keep_in_fp32_regex)
 
+        rank = torch.distributed.get_rank() 
+        print("="*10)
+        print(f"Rank {rank} parameters device type before load state dict", set([p.device.type for p in model.parameters()]))
         # Finalize model weight initialization
         if from_tf:
             model, loading_info = cls._load_from_tf(model, config, checkpoint_files)
@@ -5119,6 +5126,8 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             )
         # make sure token embedding weights are still tied if needed
         model.tie_weights()
+        print("="*10)
+        print(f"Rank {rank} parameters device type after load state dict", set([p.device.type for p in model.parameters()]))
 
         # Set model in evaluation mode to deactivate DropOut modules by default
         model.eval()
@@ -5551,7 +5560,8 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         ]
 
         error_msgs = []
-
+        import torch.distributed as dist
+        dist.breakpoint()
         if (
             os.environ.get("HF_ENABLE_PARALLEL_LOADING", "").upper() in ENV_VARS_TRUE_VALUES
             and not is_deepspeed_zero3_enabled()
@@ -5592,14 +5602,17 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             missing_keys = hf_quantizer.update_missing_keys_after_loading(model_to_load, missing_keys, prefix)
 
         # Post-processing for tensor parallelism
-        if device_mesh is not None:
+        if device_mesh is not None and "tp" in device_mesh.mesh_dim_names:
             # When using TP, the device map is a single device for all parameters
             tp_device = list(device_map.values())[0]
             # This is needed for the RotaryEmbedding, which was not initialized on the correct device as it is
             # not part of the state_dict (persistent=False)
             for buffer in model.buffers():
-                if buffer.device != tp_device:
-                    buffer.data = buffer.to(tp_device)
+                if buffer.device.type == "meta":
+                    model.to(tp_device)
+                    break
+                if buffer.device != tp_device and tp_device.type != "meta":
+                    buffer.data.copy_(buffer.to(tp_device))
 
             # In this case, the top-most task module weights were not moved to device and parallelized as they
             # were not part of the loaded weights: do it now
